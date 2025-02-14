@@ -4,6 +4,7 @@ const cors = require("cors");
 const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
 const nodemailer = require("nodemailer");
+const rateLimit = require('express-rate-limit');
 
 // Environment variables
 const username = encodeURIComponent(process.env.MONGO_USERNAME);
@@ -18,27 +19,91 @@ const MONGO_URI = `mongodb+srv://${username}:${password}@${cluster}/${dbName}?re
 
 // Initialize Express App
 const app = express();
+
+// Middleware
 app.use(cors());
 app.use(express.json());
 
-// Connect to MongoDB
+// Rate limiting
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100 // limit each IP to 100 requests per windowMs
+});
+
+app.use(limiter);
+
+// Request logging middleware
+const requestLogger = (req, res, next) => {
+  console.log(`${new Date().toISOString()} - ${req.method} ${req.url}`);
+  next();
+};
+
+app.use(requestLogger);
+
+// Connect to MongoDB with improved error handling
 mongoose.connect(MONGO_URI, {
   useNewUrlParser: true,
   useUnifiedTopology: true,
+  serverSelectionTimeoutMS: 5000,
+  socketTimeoutMS: 45000,
+}).catch(err => {
+  console.error('MongoDB connection error:', err);
+  process.exit(1);
 });
 
 const db = mongoose.connection;
 db.on("error", console.error.bind(console, "MongoDB connection error:"));
 db.once("open", () => console.log("Connected to MongoDB"));
 
-// Email Transporter
+// Email configuration with improved settings
 const transporter = nodemailer.createTransport({
   service: "gmail",
   auth: {
     user: EMAIL_USER,
     pass: EMAIL_PASS,
   },
+  tls: {
+    rejectUnauthorized: false
+  },
+  pool: true,
+  maxConnections: 5,
+  maxMessages: 100
 });
+
+// Verify email configuration on startup
+transporter.verify((error, success) => {
+  if (error) {
+    console.error('Email configuration error:', error);
+  } else {
+    console.log('Email server is ready to take messages');
+  }
+});
+
+// Email queue implementation
+const emailQueue = [];
+let isProcessingQueue = false;
+
+const processEmailQueue = async () => {
+  if (isProcessingQueue || emailQueue.length === 0) return;
+  
+  isProcessingQueue = true;
+  
+  while (emailQueue.length > 0) {
+    const { mailOptions, resolve, reject } = emailQueue.shift();
+    
+    try {
+      await transporter.sendMail(mailOptions);
+      resolve({ success: true });
+    } catch (error) {
+      reject(error);
+    }
+    
+    // Add delay between emails
+    await new Promise(resolve => setTimeout(resolve, 1000));
+  }
+  
+  isProcessingQueue = false;
+};
 
 // Middleware to verify JWT token
 const authenticateToken = (req, res, next) => {
@@ -56,6 +121,25 @@ const authenticateToken = (req, res, next) => {
     req.user = user;
     next();
   });
+};
+
+// Input validation middleware
+const validateUserInput = (req, res, next) => {
+  const { username, email, password } = req.body;
+  
+  if (username && username.length < 3) {
+    return res.status(400).json({ message: "Username must be at least 3 characters long" });
+  }
+  
+  if (email && !email.includes('@')) {
+    return res.status(400).json({ message: "Invalid email format" });
+  }
+  
+  if (password && password.length < 6) {
+    return res.status(400).json({ message: "Password must be at least 6 characters long" });
+  }
+  
+  next();
 };
 
 // Schema Definitions
@@ -88,15 +172,20 @@ const userSchema = new mongoose.Schema(
 
 const User = mongoose.model("User", userSchema);
 
+// Health check endpoint
+app.get('/health', (req, res) => {
+  res.json({ 
+    status: 'ok', 
+    timestamp: new Date(),
+    mongodb: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected'
+  });
+});
+
 // API Routes
 
 // Register User
-app.post("/api/register", async (req, res) => {
+app.post("/api/register", validateUserInput, async (req, res) => {
   const { username, email, password, name } = req.body;
-
-  if (!username || !email || !password) {
-    return res.status(400).json({ message: "All fields are required" });
-  }
 
   try {
     const existingUser = await User.findOne({ email });
@@ -121,7 +210,6 @@ app.post("/api/register", async (req, res) => {
 
     await newUser.save();
     
-    // Generate token for automatic login after registration
     const token = jwt.sign(
       { userId: newUser._id, email: newUser.email },
       JWT_SECRET,
@@ -159,7 +247,6 @@ app.post("/api/login", async (req, res) => {
       return res.status(400).json({ message: "Invalid email or password" });
     }
 
-    // Update last login time
     user.lastLogin = new Date();
     await user.save();
 
@@ -182,7 +269,7 @@ app.post("/api/login", async (req, res) => {
 });
 
 // Update User Profile
-app.put("/api/user/update", authenticateToken, async (req, res) => {
+app.put("/api/user/update", authenticateToken, validateUserInput, async (req, res) => {
   const { userId, name, username, notificationPreferences } = req.body;
 
   try {
@@ -191,12 +278,10 @@ app.put("/api/user/update", authenticateToken, async (req, res) => {
       return res.status(404).json({ message: "User not found" });
     }
 
-    // Verify user owns this profile
     if (user._id.toString() !== req.user.userId) {
       return res.status(403).json({ message: "Unauthorized to update this profile" });
     }
 
-    // Update user fields
     if (name) user.name = name;
     if (username) user.username = username;
     if (notificationPreferences) {
@@ -206,16 +291,16 @@ app.put("/api/user/update", authenticateToken, async (req, res) => {
       };
     }
 
-    await user.save();
+    const updatedUser = await user.save();
 
     res.json({
       message: "Profile updated successfully",
       user: {
-        _id: user._id,
-        username: user.username,
-        name: user.name,
-        email: user.email,
-        notificationPreferences: user.notificationPreferences,
+        _id: updatedUser._id,
+        username: updatedUser.username,
+        name: updatedUser.name,
+        email: updatedUser.email,
+        notificationPreferences: updatedUser.notificationPreferences,
       },
     });
   } catch (err) {
@@ -233,12 +318,10 @@ app.post("/api/send-email", authenticateToken, async (req, res) => {
       return res.status(404).json({ message: "User not found" });
     }
 
-    // Verify user owns this profile
     if (user._id.toString() !== req.user.userId) {
       return res.status(403).json({ message: "Unauthorized to send email for this user" });
     }
 
-    // Check if email notifications are enabled
     if (!user.notificationPreferences.email) {
       return res.status(400).json({ message: "Email notifications are disabled for this user" });
     }
@@ -250,8 +333,12 @@ app.post("/api/send-email", authenticateToken, async (req, res) => {
       text: message,
     };
 
-    await transporter.sendMail(mailOptions);
-    res.json({ success: true, message: "Email sent successfully" });
+    const result = await new Promise((resolve, reject) => {
+      emailQueue.push({ mailOptions, resolve, reject });
+      processEmailQueue();
+    });
+
+    res.json({ success: true, message: "Email queued successfully" });
   } catch (err) {
     res.status(500).json({ success: false, message: "Failed to send email", error: err.message });
   }
@@ -284,8 +371,30 @@ app.get("/api/user/profile", authenticateToken, async (req, res) => {
   }
 });
 
+// Error handling middleware
+app.use((err, req, res, next) => {
+  console.error(err.stack);
+  res.status(500).json({
+    success: false,
+    message: 'Internal server error',
+    error: process.env.NODE_ENV === 'development' ? err.message : undefined
+  });
+});
+
 // Start Server
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
+});
+
+// Graceful shutdown
+process.on('SIGTERM', () => {
+  console.log('SIGTERM received. Shutting down gracefully...');
+  server.close(() => {
+    console.log('Server closed. Disconnecting from MongoDB...');
+    mongoose.connection.close(false, () => {
+      console.log('MongoDB connection closed.');
+      process.exit(0);
+    });
+  });
 });
