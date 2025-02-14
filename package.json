@@ -1,7 +1,7 @@
 {
-  "name": "air-quality-monitor",
+  "name": "air-quality-monitor-api",
   "version": "1.0.0",
-  "description": "Air Quality Monitoring API",
+  "description": "API for Air Quality Monitoring system with authentication and email notifications",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
@@ -12,17 +12,18 @@
     "cors": "^2.8.5",
     "dotenv": "^16.3.1",
     "express": "^4.18.2",
+    "express-rate-limit": "^7.1.0",
     "jsonwebtoken": "^9.0.2",
     "mongoose": "^7.6.3",
-    "nodemailer": "^6.9.7"
+    "nodemailer": "^6.9.9"
   },
   "devDependencies": {
     "nodemon": "^3.0.1"
   },
   "engines": {
-    "node": ">=14.0.0"
+    "node": ">=16.0.0"
   },
-  "keywords": ["air quality", "monitoring", "API"],
+  "keywords": ["express", "mongoose", "jwt", "nodemailer", "api", "authentication", "rate-limit"],
   "author": "Your Name",
   "license": "MIT"
 }
