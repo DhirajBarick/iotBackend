@@ -4,166 +4,35 @@ const cors = require("cors");
 const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
 const nodemailer = require("nodemailer");
-const rateLimit = require('express-rate-limit');
 
 // Environment variables
-const username = encodeURIComponent(process.env.MONGO_USERNAME);
-const password = encodeURIComponent(process.env.MONGO_PASSWORD);
-const cluster = process.env.MONGO_CLUSTER;
-const dbName = process.env.MONGO_DB || "airQualityDB";
 const JWT_SECRET = process.env.JWT_SECRET || "airqualitymonitor2025secret";
-const EMAIL_USER = process.env.EMAIL_USER || "your-email@gmail.com";
-const EMAIL_PASS = process.env.EMAIL_PASS || "your-app-specific-password";
-
-const MONGO_URI = `mongodb+srv://${username}:${password}@${cluster}/${dbName}?retryWrites=true&w=majority&tls=true&ssl=true&authSource=admin`;
+const EMAIL_USER = process.env.EMAIL_USER;
+const EMAIL_PASS = process.env.EMAIL_PASS;
 
 // Initialize Express App
 const app = express();
-
-// Middleware
 app.use(cors());
 app.use(express.json());
 
-// Rate limiting
-const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 100 // limit each IP to 100 requests per windowMs
-});
-
-app.use(limiter);
-
-// Request logging middleware
-const requestLogger = (req, res, next) => {
-  console.log(`${new Date().toISOString()} - ${req.method} ${req.url}`);
-  next();
-};
-
-app.use(requestLogger);
-
-// Connect to MongoDB with improved error handling
-mongoose.connect(MONGO_URI, {
+// Connect to MongoDB
+mongoose.connect(process.env.MONGODB_URI || "mongodb://localhost:27017/airQualityDB", {
   useNewUrlParser: true,
   useUnifiedTopology: true,
-  serverSelectionTimeoutMS: 5000,
-  socketTimeoutMS: 45000,
-}).catch(err => {
-  console.error('MongoDB connection error:', err);
-  process.exit(1);
 });
 
 const db = mongoose.connection;
 db.on("error", console.error.bind(console, "MongoDB connection error:"));
 db.once("open", () => console.log("Connected to MongoDB"));
 
-// Email configuration with improved settings
+// Email Transporter
 const transporter = nodemailer.createTransport({
   service: "gmail",
   auth: {
     user: EMAIL_USER,
     pass: EMAIL_PASS,
   },
-  tls: {
-    rejectUnauthorized: false
-  },
-  pool: true,
-  maxConnections: 5,
-  maxMessages: 100
 });
-
-// Verify email configuration on startup
-transporter.verify((error, success) => {
-  if (error) {
-    console.error('Email configuration error:', error);
-  } else {
-    console.log('Email server is ready to take messages');
-  }
-});
-
-// Email queue implementation
-const emailQueue = [];
-let isProcessingQueue = false;
-
-const processEmailQueue = async () => {
-  if (isProcessingQueue || emailQueue.length === 0) return;
-  
-  isProcessingQueue = true;
-  
-  while (emailQueue.length > 0) {
-    const { mailOptions, resolve, reject } = emailQueue.shift();
-    
-    try {
-      await transporter.sendMail(mailOptions);
-      resolve({ success: true });
-    } catch (error) {
-      console.error('Error sending email:', error);
-      reject(error);
-    }
-    
-    // Add delay between emails
-    await new Promise(resolve => setTimeout(resolve, 1000));
-  }
-  
-  isProcessingQueue = false;
-};
-
-// AQI notification helper function
-const sendAQINotification = async (user, aqi) => {
-  if (!user.notificationPreferences.email) return;
-
-  let shouldNotify = false;
-  let subject = '';
-  let message = '';
-
-  if (aqi <= user.notificationPreferences.aqi_threshold_good && user.notificationPreferences.goodAQINotification) {
-    shouldNotify = true;
-    subject = '🌟 Good Air Quality Alert';
-    message = `Hello ${user.username},
-
-Great news! The current Air Quality Index (AQI) is ${Math.round(aqi)}, which is below your set threshold of ${user.notificationPreferences.aqi_threshold_good}.
-
-This indicates excellent air quality conditions. It's a perfect time for:
-• Outdoor activities and exercise
-• Opening windows for ventilation
-• Enjoying outdoor gatherings
-
-Keep monitoring the air quality to maintain these healthy conditions!
-
-Best regards,
-Air Quality Monitor Team`;
-  } else if (aqi >= user.notificationPreferences.aqi_threshold_bad && user.notificationPreferences.badAQINotification) {
-    shouldNotify = true;
-    subject = '⚠️ Poor Air Quality Alert';
-    message = `Hello ${user.username},
-
-Warning: The current Air Quality Index (AQI) is ${Math.round(aqi)}, which has exceeded your set threshold of ${user.notificationPreferences.aqi_threshold_bad}.
-
-Recommended precautions:
-• Limit outdoor activities
-• Keep windows closed
-• Use air purifiers if available
-• Wear appropriate masks when outdoors
-• Monitor any respiratory symptoms
-
-Please take necessary precautions to protect your health.
-
-Best regards,
-Air Quality Monitor Team`;
-  }
-
-  if (shouldNotify) {
-    const mailOptions = {
-      from: EMAIL_USER,
-      to: user.email,
-      subject,
-      text: message
-    };
-
-    await new Promise((resolve, reject) => {
-      emailQueue.push({ mailOptions, resolve, reject });
-      processEmailQueue();
-    });
-  }
-};
 
 // Middleware to verify JWT token
 const authenticateToken = (req, res, next) => {
@@ -181,25 +50,6 @@ const authenticateToken = (req, res, next) => {
     req.user = user;
     next();
   });
-};
-
-// Input validation middleware
-const validateUserInput = (req, res, next) => {
-  const { username, email, password } = req.body;
-  
-  if (username && username.length < 3) {
-    return res.status(400).json({ message: "Username must be at least 3 characters long" });
-  }
-  
-  if (email && !email.includes('@')) {
-    return res.status(400).json({ message: "Invalid email format" });
-  }
-  
-  if (password && password.length < 6) {
-    return res.status(400).json({ message: "Password must be at least 6 characters long" });
-  }
-  
-  next();
 };
 
 // Schema Definitions
@@ -232,20 +82,15 @@ const userSchema = new mongoose.Schema(
 
 const User = mongoose.model("User", userSchema);
 
-// Health check endpoint
-app.get('/health', (req, res) => {
-  res.json({ 
-    status: 'ok', 
-    timestamp: new Date(),
-    mongodb: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected'
-  });
-});
-
 // API Routes
 
 // Register User
-app.post("/api/register", validateUserInput, async (req, res) => {
+app.post("/api/register", async (req, res) => {
   const { username, email, password, name } = req.body;
+
+  if (!username || !email || !password) {
+    return res.status(400).json({ message: "All fields are required" });
+  }
 
   try {
     const existingUser = await User.findOne({ email });
@@ -276,19 +121,6 @@ app.post("/api/register", validateUserInput, async (req, res) => {
       { expiresIn: "24h" }
     );
 
-    // Send welcome email
-    const welcomeMailOptions = {
-      from: EMAIL_USER,
-      to: email,
-      subject: 'Welcome to Air Quality Monitor!',
-      text: `Welcome ${username}!\n\nThank you for registering with Air Quality Monitor. We're excited to help you monitor and maintain healthy air quality.\n\nBest regards,\nAir Quality Monitor Team`
-    };
-
-    await new Promise((resolve, reject) => {
-      emailQueue.push({ mailOptions: welcomeMailOptions, resolve, reject });
-      processEmailQueue();
-    });
-
     res.status(201).json({
       message: "User registered successfully",
       token,
@@ -297,7 +129,6 @@ app.post("/api/register", validateUserInput, async (req, res) => {
       notificationPreferences: newUser.notificationPreferences,
     });
   } catch (err) {
-    console.error('Registration error:', err);
     res.status(500).json({ message: "Error registering user", error: err.message });
   }
 });
@@ -330,19 +161,6 @@ app.post("/api/login", async (req, res) => {
       { expiresIn: "24h" }
     );
 
-    // Send login notification email
-    const loginMailOptions = {
-      from: EMAIL_USER,
-      to: email,
-      subject: 'New Login to Your Account',
-      text: `Hello ${user.username},\n\nWe detected a new login to your Air Quality Monitor account at ${new Date().toLocaleString()}.\n\nIf this wasn't you, please contact support immediately.\n\nBest regards,\nAir Quality Monitor Team`
-    };
-
-    await new Promise((resolve, reject) => {
-      emailQueue.push({ mailOptions: loginMailOptions, resolve, reject });
-      processEmailQueue();
-    });
-
     res.json({
       message: "Login successful",
       token,
@@ -351,13 +169,12 @@ app.post("/api/login", async (req, res) => {
       notificationPreferences: user.notificationPreferences,
     });
   } catch (err) {
-    console.error('Login error:', err);
     res.status(500).json({ message: "Error logging in", error: err.message });
   }
 });
 
 // Update User Profile
-app.put("/api/user/update", authenticateToken, validateUserInput, async (req, res) => {
+app.put("/api/user/update", authenticateToken, async (req, res) => {
   const { userId, name, username, notificationPreferences } = req.body;
 
   try {
@@ -379,40 +196,27 @@ app.put("/api/user/update", authenticateToken, validateUserInput, async (req, re
       };
     }
 
-    const updatedUser = await user.save();
-
-    // Send profile update confirmation email
-    const updateMailOptions = {
-      from: EMAIL_USER,
-      to: user.email,
-      subject: 'Profile Updated Successfully',
-      text: `Hello ${user.username},\n\nYour Air Quality Monitor profile has been updated successfully at ${new Date().toLocaleString()}.\n\nBest regards,\nAir Quality Monitor Team`
-    };
-
-    await new Promise((resolve, reject) => {
-      emailQueue.push({ mailOptions: updateMailOptions, resolve, reject });
-      processEmailQueue();
-    });
+    await user.save();
 
     res.json({
       message: "Profile updated successfully",
       user: {
-        _id: updatedUser._id,
-        username: updatedUser.username,
-        name: updatedUser.name,
-        email: updatedUser.email,
-        notificationPreferences: updatedUser.notificationPreferences,
+        _id: user._id,
+        username: user.username,
+        name: user.name,
+        email: user.email,
+        notificationPreferences: user.notificationPreferences,
       },
     });
   } catch (err) {
-    console.error('Profile update error:', err);
+    console.error("Profile update error:", err.message);
     res.status(500).json({ message: "Error updating profile", error: err.message });
   }
 });
 
 // Send Email Notification
 app.post("/api/send-email", authenticateToken, async (req, res) => {
-  const { userId, subject, message, aqi } = req.body;
+  const { userId, subject, message } = req.body;
 
   try {
     const user = await User.findById(userId);
@@ -428,26 +232,17 @@ app.post("/api/send-email", authenticateToken, async (req, res) => {
       return res.status(400).json({ message: "Email notifications are disabled for this user" });
     }
 
-    // Check if this is an AQI notification
-    if (aqi !== undefined) {
-      await sendAQINotification(user, aqi);
-    } else {
-      const mailOptions = {
-        from: EMAIL_USER,
-        to: user.email,
-        subject: subject,
-        text: message,
-      };
+    const mailOptions = {
+      from: EMAIL_USER,
+      to: user.email,
+      subject: subject,
+      text: message,
+    };
 
-      await new Promise((resolve, reject) => {
-        emailQueue.push({ mailOptions, resolve, reject });
-        processEmailQueue();
-      });
-    }
-
-    res.json({ success: true, message: "Email queued successfully" });
+    await transporter.sendMail(mailOptions);
+    res.json({ success: true, message: "Email sent successfully" });
   } catch (err) {
-    console.error('Email sending error:', err);
+    console.error("Email sending error:", err.message);
     res.status(500).json({ success: false, message: "Failed to send email", error: err.message });
   }
 });
@@ -459,23 +254,9 @@ app.post("/api/logout", authenticateToken, async (req, res) => {
     if (user) {
       user.lastLogout = new Date();
       await user.save();
-
-      // Send logout notification email
-      const logoutMailOptions = {
-        from: EMAIL_USER,
-        to: user.email,
-        subject: 'Logged Out Successfully',
-        text: `Hello ${user.username},\n\nYou have been logged out of your Air Quality Monitor account at ${new Date().toLocaleString()}.\n\nBest regards,\nAir Quality Monitor Team`
-      };
-
-      await new Promise((resolve, reject) => {
-        emailQueue.push({ mailOptions: logoutMailOptions, resolve, reject });
-        processEmailQueue();
-      });
     }
     res.json({ message: "Logout recorded successfully" });
   } catch (err) {
-    console.error('Logout error:', err);
     res.status(500).json({ message: "Error recording logout", error: err.message });
   }
 });
@@ -489,35 +270,12 @@ app.get("/api/user/profile", authenticateToken, async (req, res) => {
     }
     res.json(user);
   } catch (err) {
-    console.error('Profile fetch error:', err);
     res.status(500).json({ message: "Error fetching profile", error: err.message });
   }
 });
 
-// Error handling middleware
-app.use((err, req, res, next) => {
-  console.error(err.stack);
-  res.status(500).json({
-    success: false,
-    message: 'Internal server error',
-    error: process.env.NODE_ENV === 'development' ? err.message : undefined
-  });
-});
-
 // Start Server
 const PORT = process.env.PORT || 5000;
-const server = app.listen(PORT, () => {
+app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
-});
-
-// Graceful shutdown
-process.on('SIGTERM', () => {
-  console.log('SIGTERM received. Shutting down gracefully...');
-  server.close(() => {
-    console.log('Server closed. Disconnecting from MongoDB...');
-    mongoose.connection.close(false, () => {
-      console.log('MongoDB connection closed.');
-      process.exit(0);
-    });
-  });
 });
